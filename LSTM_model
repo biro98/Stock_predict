@@ -1,0 +1,298 @@
+import torch
+import torch.nn as nn
+import yfinance as yf
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error
+import math
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+# Seed for reproducibility
+np.random.seed(42)
+torch.manual_seed(42)
+
+# Determine the device to be used for training
+def get_device():
+    return torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+
+device = get_device()
+print("Using device:", device)
+
+class StockDataset(torch.utils.data.Dataset):
+    def __init__(self, sequences):
+        sequences = sequences.astype(np.float32)  # Cast to float32
+        self.x_data = sequences[:, :-1]
+        self.y_data = sequences[:, -1]
+
+    def __len__(self):
+        return len(self.x_data)
+
+    def __getitem__(self, idx):
+        return self.x_data[idx], self.y_data[idx]
+
+# Function to create sequences with look_back period
+def create_sequences(data, look_back):
+    sequences = []
+    for i in range(len(data) - look_back):
+        sequences.append(data[i:(i + look_back + 1)])
+    return np.array(sequences)
+
+# Load stock data
+stock = yf.Ticker('^NDX')
+data = stock.history(period="7y")  # Adjust period as needed
+print(data.head())
+
+# Select 'Close' feature and normalize data
+close_prices = data[['Close']].values
+scaler = MinMaxScaler(feature_range=(-1, 1))
+scaled_close_prices = scaler.fit_transform(close_prices)
+
+# Create sequences
+look_back = 7  # Change look_back period to 7
+sequences = create_sequences(scaled_close_prices, look_back)
+
+
+
+# Splitting the data into training and testing sets
+test_set_size = int(np.round(0.1*sequences.shape[0]))
+train_sequences = sequences[:-test_set_size]
+test_sequences = sequences[-test_set_size:]
+
+# Shuffle the training sequences
+np.random.shuffle(train_sequences)
+
+# Creating PyTorch DataLoader instances
+batch_size = 32
+train_dataset = StockDataset(train_sequences)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+test_dataset = StockDataset(test_sequences)
+test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)  # batch_size for test loader can be 1 for sequential prediction
+# Define the simplified LSTM model
+class SimpleLSTM(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers, output_dim=1):
+        super(SimpleLSTM, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        
+        # Define the LSTM layer
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+        
+        # Define the output layer
+        self.linear = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        # Initialize hidden and cell states with zeros
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(device)
+        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(device)
+        
+        # Forward propagate the LSTM
+        out, _ = self.lstm(x, (h0, c0))
+        out = self.linear(out[:, -1, :])  # Take the last time step
+        return out
+
+# Create the simplified LSTM model, define the loss function and the optimizer
+model = SimpleLSTM(input_dim=1, hidden_dim=256, num_layers=2).to(device)
+loss_function = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+def inverse_transform(scaler, y_pred, y_true):
+    y_pred = y_pred.squeeze()  # Ensure y_pred is one-dimensional
+    y_true = y_true.squeeze()  # Ensure y_true is one-dimensional
+    y_pred_rescaled = scaler.inverse_transform(y_pred.reshape(-1, 1))
+    y_true_rescaled = scaler.inverse_transform(y_true.reshape(-1, 1))
+    return y_pred_rescaled, y_true_rescaled
+# Training the model
+epochs = 100
+train_losses = []
+train_mae_records = []
+val_losses = []
+val_mae_records = []
+train_errors_list = []
+val_errors_list = []
+
+for epoch in tqdm(range(epochs)):
+    model.train()
+    total_loss = 0
+    total_mae_train = 0
+    for batch_x, batch_y in train_loader:
+        batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+        optimizer.zero_grad()
+        y_pred = model(batch_x)
+        loss = loss_function(y_pred, batch_y)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+
+        # Inverse transform and then calculate MAE
+        y_pred_rescaled, y_true_rescaled = inverse_transform(scaler, y_pred.detach().cpu().numpy(), batch_y.cpu().numpy())
+        total_mae_train += mean_absolute_error(y_true_rescaled, y_pred_rescaled)
+        # Calculate pure prediction errors for the training set
+        train_errors = y_true_rescaled.flatten() - y_pred_rescaled.flatten()
+        train_errors_list.extend(train_errors)
+
+
+    train_losses.append(total_loss / len(train_loader))
+    train_mae_records.append(total_mae_train / len(train_loader))
+
+    # Validation phase: Calculate validation loss and MAE
+    total_val_loss = 0
+    total_mae_val = 0
+    with torch.no_grad():
+        model.eval()
+        for batch_x, batch_y in test_loader:
+            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+            y_val_pred = model(batch_x)
+            val_loss = loss_function(y_val_pred, batch_y)
+            total_val_loss += val_loss.item()
+
+            # Inverse transform and then calculate MAE
+            y_val_pred_rescaled, y_val_true_rescaled = inverse_transform(scaler, y_val_pred.cpu().numpy(), batch_y.cpu().numpy())
+            total_mae_val += mean_absolute_error(y_val_true_rescaled, y_val_pred_rescaled)
+            # Calculate pure prediction errors for the validation set
+            val_errors = y_val_true_rescaled.flatten() - y_val_pred_rescaled.flatten()
+            val_errors_list.extend(val_errors)
+
+    val_losses.append(total_val_loss / len(test_loader))
+    val_mae_records.append(total_mae_val / len(test_loader))
+
+    print(f'Epoch {epoch} train loss: {train_losses[-1]} train MAE: {train_mae_records[-1]}, val loss: {val_losses[-1]} val MAE: {val_mae_records[-1]}')
+
+# Plotting the training and validation MSE losses
+plt.figure(figsize=(10, 5))
+plt.plot(train_losses, label='Training Loss (MSE)')
+plt.plot(val_losses, label='Validation Loss (MSE)')
+plt.title('Training and Validation MSE Loss')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# Plotting the MAE distributions for training and test sets
+plt.figure(figsize=(10, 5))
+plt.hist(train_mae_records, bins=50, alpha=0.7, label='Training MAE Distribution')
+plt.hist(val_mae_records, bins=50, alpha=0.7, label='Validation MAE Distribution')
+plt.title('Distribution of MAE Scores')
+plt.xlabel('MAE')
+plt.ylabel('Frequency')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# plot the pure error distributions
+plt.figure(figsize=(10, 5))
+#plt.hist(train_errors_list, bins=50, alpha=0.7, label='Training Error Distribution')
+plt.hist(val_errors_list, bins=50, alpha=0.7, label='Validation Error Distribution')
+plt.title('Distribution of Pure Prediction Errors')
+plt.xlabel('Error')
+plt.ylabel('Frequency')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+from sklearn.metrics import  r2_score
+
+
+def inverse_transform(scaler, feature_index, data):
+    data = data.squeeze()  # Ensure data is one-dimensional
+    dummy = np.zeros((len(data), 1))
+    dummy[:, feature_index] = data
+    dummy = scaler.inverse_transform(dummy)
+    return dummy[:, feature_index]
+
+# Making predictions on training data for R2 score and RMSE
+model.eval()  # Set the model to evaluation mode
+train_predictions = []
+train_actual = []
+with torch.no_grad():
+    for batch_x, batch_y in train_loader:
+        batch_x = batch_x.to(device)
+        y_train_pred = model(batch_x)
+        train_predictions.append(y_train_pred.cpu().numpy())
+        train_actual.append(batch_y.cpu().numpy())
+
+# Flatten the predictions and actual values into single arrays
+train_predictions = np.concatenate(train_predictions).squeeze()
+train_actual = np.concatenate(train_actual).squeeze()
+
+# Inverse scale the predictions and actual values for training data
+y_train_pred_rescaled = inverse_transform(scaler, 0, train_predictions)
+y_train_actual_rescaled = inverse_transform(scaler, 0, train_actual)
+
+# Calculate R2 score and RMSE for training data
+r2_train = r2_score(y_train_actual_rescaled, y_train_pred_rescaled)
+rmse_train = math.sqrt(mean_squared_error(y_train_actual_rescaled, y_train_pred_rescaled))
+
+# Output R2 score and RMSE for training data
+print(f'Training R2 Score: {r2_train}')
+print(f'Training RMSE: {rmse_train}')
+
+# Repeat for test data
+test_predictions = []
+test_actual = []
+with torch.no_grad():
+    for batch_x, batch_y in test_loader:
+        batch_x = batch_x.to(device)
+        y_test_pred = model(batch_x)
+        test_predictions.append(y_test_pred.cpu().numpy())
+        test_actual.append(batch_y.cpu().numpy())
+
+# Flatten the predictions and actual values into single arrays
+test_predictions = np.concatenate(test_predictions).squeeze()
+test_actual = np.concatenate(test_actual).squeeze()
+
+# Inverse scale the predictions and actual values for test data
+y_pred_rescaled = inverse_transform(scaler, 0, test_predictions)
+y_actual_rescaled = inverse_transform(scaler, 0, test_actual)
+
+# Calculate R2 score, RMSE, and MAE for test data
+r2_test = r2_score(y_actual_rescaled, y_pred_rescaled)
+rmse_test = math.sqrt(mean_squared_error(y_actual_rescaled, y_pred_rescaled))
+mae_test = mean_absolute_error(y_actual_rescaled, y_pred_rescaled)
+
+# Output R2 score, RMSE, and MAE for test data
+print(f'Test R2 Score: {r2_test}')
+print(f'Test RMSE: {rmse_test}')
+print(f'Test MAE: {mae_test}')
+
+
+# Plotting MAE and RMSE
+plt.figure(figsize=(10, 5))
+plt.bar(['RMSE', 'MAE'], [rmse_test, mae_test], color=['blue', 'orange'])
+plt.title('Error Metrics Comparison')
+plt.ylabel('Error Value')
+plt.show()
+
+# Plotting Predicted vs True values
+plt.figure(figsize=(10, 5))
+plt.scatter(y_train_actual_rescaled, y_train_pred_rescaled, label='Training Data', alpha=0.5)
+plt.scatter(y_actual_rescaled, y_pred_rescaled, label='Test Data', alpha=0.5)
+plt.title('Predicted vs True Values')
+plt.xlabel('True Values')
+plt.ylabel('Predicted Values')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# Insert the new code for extracting dates here
+date_range_test = data.index[-test_set_size:]  # Adjust this if your indexing differs
+aligned_dates = date_range_test[-len(y_pred_rescaled):]  # Aligning dates with predictions
+
+# Insert the plotting code with dates on the x-axis here
+plt.figure(figsize=(15, 7))
+plt.plot(aligned_dates, y_actual_rescaled, label='Actual Prices', color='black')
+plt.plot(aligned_dates, y_pred_rescaled, label='Predicted Prices', color='red', linestyle='--')
+plt.title('Comparison of Actual and Predicted Prices')
+plt.xlabel('Date')
+plt.ylabel('Stock Price')
+plt.legend()
+plt.grid(True)
+plt.xticks(rotation=45)  # Rotate x-axis labels for better readability
+plt.tight_layout()  # Adjust layout to ensure everything fits without overlap
+plt.show()
+
